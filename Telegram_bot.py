@@ -60,22 +60,16 @@ URL_RE = re.compile(
     re.IGNORECASE,
 )
 
-# নাম হিসেবে skip করার pattern
 SKIP_LINE_RE = re.compile(
     r"^(TG\s*[-–]|👤|@|\d+[.)]\s*|link\s*dropped|লিংক|url\s*[:\-]?$)",
     re.IGNORECASE,
 )
 
 def normalize_url(url: str) -> str:
-    """trailing punctuation সরাবে কিন্তু query params রাখবে"""
     return re.sub(r"[.,!?;)\]]+$", "", url)
 
 def extract_links(text: str) -> list[dict]:
-    """
-    যেকোনো ফরম্যাট থেকে লিংক + নাম বের করে।
-    নাম না পেলে খালি string রাখে।
-    """
-    found: dict[str, str] = {}  # url → name
+    found: dict[str, str] = {}
     lines = text.splitlines()
 
     for i, line in enumerate(lines):
@@ -87,16 +81,14 @@ def extract_links(text: str) -> list[dict]:
         for raw_url in urls_in_line:
             url = normalize_url(raw_url)
             if url in found:
-                continue  # ✅ একই রানে duplicate skip
+                continue
 
-            # একই লাইনে URL-এর আগে কিছু আছে কিনা দেখো
             before = line_stripped[:line_stripped.index(raw_url)].strip().rstrip(":-–—।").strip()
 
             if before and not SKIP_LINE_RE.match(before):
                 found[url] = before
                 continue
 
-            # আগের সর্বোচ্চ ৪টি লাইন থেকে নাম খোঁজো
             name = ""
             for j in range(i - 1, max(i - 5, -1), -1):
                 prev = lines[j].strip()
@@ -104,7 +96,6 @@ def extract_links(text: str) -> list[dict]:
                     continue
                 if SKIP_LINE_RE.match(prev):
                     continue
-                # অন্য URL থাকলে stop
                 if URL_RE.search(prev):
                     break
                 candidate = prev.rstrip(":").strip()
@@ -114,7 +105,7 @@ def extract_links(text: str) -> list[dict]:
 
             found[url] = name
 
-    # Fallback: কোনো URL মিস হলে ধরো
+    # Fallback
     for m in URL_RE.finditer(text):
         url = normalize_url(m.group(0))
         if url not in found:
@@ -178,14 +169,12 @@ def expire_old_entries(store: dict) -> dict:
     }
 
 def all_saved_urls(store: dict) -> set[str]:
-    """Gist-এ সেভ থাকা সব URL একটা set-এ রিটার্ন করে"""
     urls = set()
     for links in store.values():
         for item in links:
             urls.add(item["url"])
     return urls
 
-async def process_links(new_items: list[dict]) -> tuple[list[dict], list[dict]]:
 async def process_links(new_items: list[dict]) -> tuple[list[dict], list[dict]]:
     try:
         store = await gist_read()
@@ -215,50 +204,6 @@ async def process_links(new_items: list[dict]) -> tuple[list[dict], list[dict]]:
             log.exception("gist_write failed")
 
     return unique_items, duplicate_items
-
-
-async def handle_message(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    if not await owner_only(update):
-        return
-
-    text = update.message.text or update.message.caption or ""
-    if not text:
-        return
-
-    new_items = extract_links(text)
-    log.info("Extracted %d links: %s", len(new_items), new_items)
-
-    if not new_items:
-        # ✅ লিংক না পেলে চুপ থাকবে (reply দেবে না)
-        return
-
-    unique, dupes = await process_links(new_items)
-    log.info("unique=%d dupes=%d", len(unique), len(dupes))
-
-    lines = []
-
-    if dupes:
-        lines.append(f"🔁 *ডুপ্লিকেট লিংক ({len(dupes)} টি):*")
-        for item in dupes:
-            label = item["name"] if item["name"] else item["url"]
-            lines.append(f"  • {label}")
-
-    if unique:
-        lines.append(f"\n✅ *নতুন লিংক সেভ ({len(unique)} টি):*")
-        for item in unique:
-            label = item["name"] if item["name"] else item["url"]
-            lines.append(f"  • {label}")
-
-    if lines:
-        await update.message.reply_text(
-            "\n".join(lines),
-            parse_mode="Markdown",
-            disable_web_page_preview=True,
-        )
-    else:
-        # ✅ এই case হওয়া উচিত না, হলে debug করতে পারবেন
-        log.warning("No lines to send despite %d items", len(new_items))
-        await update.message.reply_text("⚠️ কিছু প্রসেস হয়নি — log চেক করুন।")
 
 
 # ─── TELEGRAM HANDLERS ──────────────────────────────────────────────────────────
@@ -300,10 +245,13 @@ async def handle_message(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         return
 
     new_items = extract_links(text)
+    log.info("Extracted %d links: %s", len(new_items), new_items)
+
     if not new_items:
         return
 
     unique, dupes = await process_links(new_items)
+    log.info("unique=%d dupes=%d", len(unique), len(dupes))
 
     lines = []
 
@@ -325,6 +273,9 @@ async def handle_message(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             parse_mode="Markdown",
             disable_web_page_preview=True,
         )
+    else:
+        log.warning("No lines to send despite %d items", len(new_items))
+        await update.message.reply_text("⚠️ কিছু প্রসেস হয়নি — log চেক করুন।")
 
 
 # ─── MAIN ────────────────────────────────────────────────────────────────────────
