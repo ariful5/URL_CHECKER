@@ -186,27 +186,79 @@ def all_saved_urls(store: dict) -> set[str]:
     return urls
 
 async def process_links(new_items: list[dict]) -> tuple[list[dict], list[dict]]:
-    store = await gist_read()
+async def process_links(new_items: list[dict]) -> tuple[list[dict], list[dict]]:
+    try:
+        store = await gist_read()
+    except Exception as e:
+        log.exception("gist_read failed")
+        store = {}
+
     store = expire_old_entries(store)
-    saved_urls = all_saved_urls(store)  # ✅ Gist থেকে আগের সব URL
+    saved_urls = all_saved_urls(store)
 
     unique_items    = []
     duplicate_items = []
 
     for item in new_items:
         if item["url"] in saved_urls:
-            # ✅ আগে থেকে Gist-এ আছে → duplicate
             duplicate_items.append(item)
         else:
             unique_items.append(item)
-            saved_urls.add(item["url"])  # ✅ এই রানে আর দ্বিতীয়বার সেভ হবে না
+            saved_urls.add(item["url"])
 
     today = today_str()
     if unique_items:
         store.setdefault(today, []).extend(unique_items)
-        await gist_write(store)
+        try:
+            await gist_write(store)
+        except Exception as e:
+            log.exception("gist_write failed")
 
     return unique_items, duplicate_items
+
+
+async def handle_message(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    if not await owner_only(update):
+        return
+
+    text = update.message.text or update.message.caption or ""
+    if not text:
+        return
+
+    new_items = extract_links(text)
+    log.info("Extracted %d links: %s", len(new_items), new_items)
+
+    if not new_items:
+        # ✅ লিংক না পেলে চুপ থাকবে (reply দেবে না)
+        return
+
+    unique, dupes = await process_links(new_items)
+    log.info("unique=%d dupes=%d", len(unique), len(dupes))
+
+    lines = []
+
+    if dupes:
+        lines.append(f"🔁 *ডুপ্লিকেট লিংক ({len(dupes)} টি):*")
+        for item in dupes:
+            label = item["name"] if item["name"] else item["url"]
+            lines.append(f"  • {label}")
+
+    if unique:
+        lines.append(f"\n✅ *নতুন লিংক সেভ ({len(unique)} টি):*")
+        for item in unique:
+            label = item["name"] if item["name"] else item["url"]
+            lines.append(f"  • {label}")
+
+    if lines:
+        await update.message.reply_text(
+            "\n".join(lines),
+            parse_mode="Markdown",
+            disable_web_page_preview=True,
+        )
+    else:
+        # ✅ এই case হওয়া উচিত না, হলে debug করতে পারবেন
+        log.warning("No lines to send despite %d items", len(new_items))
+        await update.message.reply_text("⚠️ কিছু প্রসেস হয়নি — log চেক করুন।")
 
 
 # ─── TELEGRAM HANDLERS ──────────────────────────────────────────────────────────
