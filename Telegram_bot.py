@@ -17,9 +17,9 @@ from telegram.ext import ApplicationBuilder, CommandHandler, MessageHandler, fil
 import httpx
 
 # ─── CONFIG ────────────────────────────────────────────────────────────────────
-TELEGRAM_TOKEN = os.environ.get("TELEGRAM_TOKEN", "YOUR_TELEGRAM_BOT_TOKEN")
-GITHUB_TOKEN   = os.environ.get("GITHUB_TOKEN",   "YOUR_GITHUB_TOKEN")
-GIST_ID        = os.environ.get("GIST_ID",        "YOUR_GIST_ID")   # create once, reuse
+TELEGRAM_TOKEN = os.environ.get("TELEGRAM_TOKEN")
+GITHUB_TOKEN   = os.environ.get("GTHUB_TOKEN")
+GIST_ID        = os.environ.get("GIST_ID")   # create once, reuse
 GIST_FILENAME  = "link_store.json"
 KEEP_DAYS      = 3
 
