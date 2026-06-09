@@ -256,7 +256,6 @@ async def handle_message(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     lines = []
 
     if dupes:
-    if dupes:
         lines.append(f"🔁 ডুপ্লিকেট লিংক ({len(dupes)} টি):")   # * নেই
         for item in dupes:
             label = item["name"] if item["name"] else item["url"]
