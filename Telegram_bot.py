@@ -5,6 +5,7 @@ Telegram Duplicate Link Detector Bot
 - Detects duplicate URLs (ignores names)
 - Uses GitHub Gist for persistent storage
 - Extracts links and optional names from messages
+- Only the bot OWNER can use this bot
 """
 
 import os
@@ -18,8 +19,9 @@ import httpx
 
 # ─── CONFIG ────────────────────────────────────────────────────────────────────
 TELEGRAM_TOKEN = os.environ.get("TELEGRAM_TOKEN")
-GITHUB_TOKEN   = os.environ.get("GTHUB_TOKEN")
-GIST_ID        = os.environ.get("GIST_ID")   # create once, reuse
+GITHUB_TOKEN   = os.environ.get("GTHUB_TOKEN")    # GitHub Actions এ GITHUB_ prefix রিজার্ভড, তাই GTHUB_ ব্যবহার করা হয়েছে
+GIST_ID        = os.environ.get("GIST_ID")
+OWNER_ID       = int(os.environ.get("OWNER_ID", "0"))  # ✅ আপনার Telegram User ID
 GIST_FILENAME  = "link_store.json"
 KEEP_DAYS      = 3
 
@@ -29,13 +31,41 @@ logging.basicConfig(
 )
 log = logging.getLogger(__name__)
 
+# ✅ স্টার্টেই চেক করবে — কোনো ভেরিয়েবল মিস হলে বট চালু হবে না
+def validate_config():
+    missing = []
+    if not TELEGRAM_TOKEN: missing.append("TELEGRAM_TOKEN")
+    if not GITHUB_TOKEN:   missing.append("GITHUB_TOKEN")
+    if not GIST_ID:        missing.append("GIST_ID")
+    if OWNER_ID == 0:      missing.append("OWNER_ID")
+    if missing:
+        raise ValueError(f"❌ Missing environment variables: {', '.join(missing)}")
+
+# ─── OWNER-ONLY GUARD ──────────────────────────────────────────────────────────
+def is_owner(update: Update) -> bool:
+    """শুধু OWNER_ID ম্যাচ করলে True রিটার্ন করবে।"""
+    return update.effective_user.id == OWNER_ID
+
+async def owner_only(update: Update) -> bool:
+    """
+    যদি owner না হয়, সাইলেন্টলি ignore করবে।
+    True মানে owner, False মানে অন্য কেউ।
+    """
+    if not is_owner(update):
+        log.warning(
+            "Unauthorized access attempt by user_id=%s username=%s",
+            update.effective_user.id,
+            update.effective_user.username,
+        )
+        return False
+    return True
+
 # ─── URL EXTRACTION ─────────────────────────────────────────────────────────────
 URL_RE = re.compile(
     r"https?://[^\s\)\]\>,\"\']+",
     re.IGNORECASE,
 )
 
-# Patterns like:  নাম: লিংক  |  Name - link  |  1. Name link
 NAME_BEFORE_RE = re.compile(
     r"(?:^|\n)\s*(?:\d+[.\)]\s*)?([^\n\-:।]+?)\s*[-:।]\s*(https?://\S+)",
     re.MULTILINE,
@@ -45,30 +75,22 @@ NAME_AFTER_RE = re.compile(
 )
 
 def normalize_url(url: str) -> str:
-    """Strip trailing punctuation that may have been captured."""
     return url.rstrip(".,!?;)")
 
 def extract_links(text: str) -> list[dict]:
-    """
-    Returns list of {"url": ..., "name": ...} dicts.
-    Name is empty string if not found.
-    """
-    found: dict[str, str] = {}  # url -> name
+    found: dict[str, str] = {}
 
-    # Try name-before-link pattern first
     for m in NAME_BEFORE_RE.finditer(text):
         name = m.group(1).strip()
         url  = normalize_url(m.group(2).strip())
         found[url] = name
 
-    # Try name-after-link pattern
     for m in NAME_AFTER_RE.finditer(text):
         url  = normalize_url(m.group(1).strip())
         name = m.group(2).strip()
         if url not in found:
             found[url] = name
 
-    # Catch any remaining bare URLs
     for m in URL_RE.finditer(text):
         url = normalize_url(m.group(0))
         if url not in found:
@@ -78,17 +100,17 @@ def extract_links(text: str) -> list[dict]:
 
 
 # ─── GIST STORAGE ───────────────────────────────────────────────────────────────
-GIST_HEADERS = {
-    "Authorization": f"token {GITHUB_TOKEN}",
-    "Accept": "application/vnd.github+json",
-}
+def gist_headers() -> dict:
+    return {
+        "Authorization": f"token {GITHUB_TOKEN}",
+        "Accept": "application/vnd.github+json",
+    }
 
 async def gist_read() -> dict:
-    """Read JSON store from Gist. Returns {} on error."""
     async with httpx.AsyncClient() as client:
         r = await client.get(
             f"https://api.github.com/gists/{GIST_ID}",
-            headers=GIST_HEADERS,
+            headers=gist_headers(),
             timeout=10,
         )
     if r.status_code != 200:
@@ -101,7 +123,6 @@ async def gist_read() -> dict:
         return {}
 
 async def gist_write(data: dict) -> bool:
-    """Write JSON store to Gist."""
     payload = {
         "files": {
             GIST_FILENAME: {"content": json.dumps(data, ensure_ascii=False, indent=2)}
@@ -110,7 +131,7 @@ async def gist_write(data: dict) -> bool:
     async with httpx.AsyncClient() as client:
         r = await client.patch(
             f"https://api.github.com/gists/{GIST_ID}",
-            headers=GIST_HEADERS,
+            headers=gist_headers(),
             json=payload,
             timeout=10,
         )
@@ -125,7 +146,6 @@ def today_str() -> str:
     return datetime.now(timezone.utc).strftime("%Y-%m-%d")
 
 def expire_old_entries(store: dict) -> dict:
-    """Remove entries older than KEEP_DAYS."""
     cutoff = datetime.now(timezone.utc) - timedelta(days=KEEP_DAYS)
     return {
         date_key: links
@@ -141,11 +161,6 @@ def all_saved_urls(store: dict) -> set[str]:
     return urls
 
 async def process_links(new_items: list[dict]) -> tuple[list[dict], list[dict]]:
-    """
-    Compares new_items against stored links.
-    Returns (unique_items, duplicate_items).
-    Saves unique items to store.
-    """
     store = await gist_read()
     store = expire_old_entries(store)
     saved_urls = all_saved_urls(store)
@@ -158,9 +173,8 @@ async def process_links(new_items: list[dict]) -> tuple[list[dict], list[dict]]:
             duplicate_items.append(item)
         else:
             unique_items.append(item)
-            saved_urls.add(item["url"])   # prevent intra-batch duplicates
+            saved_urls.add(item["url"])
 
-    # Append unique items under today's date
     today = today_str()
     if unique_items:
         store.setdefault(today, []).extend(unique_items)
@@ -171,6 +185,8 @@ async def process_links(new_items: list[dict]) -> tuple[list[dict], list[dict]]:
 
 # ─── TELEGRAM HANDLERS ──────────────────────────────────────────────────────────
 async def cmd_start(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    if not await owner_only(update):
+        return
     await update.message.reply_text(
         "👋 আমি ডুপ্লিকেট লিংক ডিটেক্টর বট!\n\n"
         "যেকোনো বার্তায় লিংক পাঠান। আমি ৩ দিনের মধ্যে দেওয়া লিংকগুলোর সাথে মিলিয়ে দেখব।\n\n"
@@ -181,6 +197,8 @@ async def cmd_start(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     )
 
 async def cmd_stats(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    if not await owner_only(update):
+        return
     store = await gist_read()
     store = expire_old_entries(store)
     total = sum(len(v) for v in store.values())
@@ -190,17 +208,23 @@ async def cmd_stats(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text("\n".join(lines))
 
 async def cmd_clear(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    if not await owner_only(update):
+        return
     await gist_write({})
     await update.message.reply_text("✅ সব লিংক মুছে ফেলা হয়েছে।")
 
 async def handle_message(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    if not await owner_only(update):
+        return
+
+    # ✅ টেক্সট এবং ক্যাপশন দুটোই সাপোর্ট করবে
     text = update.message.text or update.message.caption or ""
     if not text:
         return
 
     new_items = extract_links(text)
     if not new_items:
-        return  # No links found, ignore silently
+        return
 
     unique, dupes = await process_links(new_items)
 
@@ -232,14 +256,16 @@ async def handle_message(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 
 # ─── MAIN ────────────────────────────────────────────────────────────────────────
 def main():
+    validate_config()  # ✅ সব ভেরিয়েবল চেক
     app = ApplicationBuilder().token(TELEGRAM_TOKEN).build()
     app.add_handler(CommandHandler("start", cmd_start))
     app.add_handler(CommandHandler("stats", cmd_stats))
     app.add_handler(CommandHandler("clear", cmd_clear))
+    # ✅ টেক্সট + ক্যাপশন (ছবি/ফাইলের সাথে লিংক) দুটোই ধরবে
     app.add_handler(MessageHandler(filters.TEXT | filters.CAPTION, handle_message))
-    log.info("Bot starting…")
+    log.info("Bot starting… Owner ID: %s", OWNER_ID)
     app.run_polling()
 
 if __name__ == "__main__":
     main()
-      
+    
