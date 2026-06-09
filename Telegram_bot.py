@@ -19,9 +19,9 @@ import httpx
 
 # ─── CONFIG ────────────────────────────────────────────────────────────────────
 TELEGRAM_TOKEN = os.environ.get("TELEGRAM_TOKEN")
-GITHUB_TOKEN   = os.environ.get("GTHUB_TOKEN")    # GitHub Actions এ GITHUB_ prefix রিজার্ভড, তাই GTHUB_ ব্যবহার করা হয়েছে
+GITHUB_TOKEN   = os.environ.get("GTHUB_TOKEN")
 GIST_ID        = os.environ.get("GIST_ID")
-OWNER_ID       = int(os.environ.get("OWNER_ID", "0"))  # ✅ আপনার Telegram User ID
+OWNER_ID       = int(os.environ.get("OWNER_ID", "0"))
 GIST_FILENAME  = "link_store.json"
 KEEP_DAYS      = 3
 
@@ -31,7 +31,6 @@ logging.basicConfig(
 )
 log = logging.getLogger(__name__)
 
-# ✅ স্টার্টেই চেক করবে — কোনো ভেরিয়েবল মিস হলে বট চালু হবে না
 def validate_config():
     missing = []
     if not TELEGRAM_TOKEN: missing.append("TELEGRAM_TOKEN")
@@ -43,14 +42,9 @@ def validate_config():
 
 # ─── OWNER-ONLY GUARD ──────────────────────────────────────────────────────────
 def is_owner(update: Update) -> bool:
-    """শুধু OWNER_ID ম্যাচ করলে True রিটার্ন করবে।"""
     return update.effective_user.id == OWNER_ID
 
 async def owner_only(update: Update) -> bool:
-    """
-    যদি owner না হয়, সাইলেন্টলি ignore করবে।
-    True মানে owner, False মানে অন্য কেউ।
-    """
     if not is_owner(update):
         log.warning(
             "Unauthorized access attempt by user_id=%s username=%s",
@@ -66,31 +60,61 @@ URL_RE = re.compile(
     re.IGNORECASE,
 )
 
-NAME_BEFORE_RE = re.compile(
-    r"(?:^|\n)\s*(?:\d+[.\)]\s*)?([^\n\-:।]+?)\s*[-:।]\s*(https?://\S+)",
-    re.MULTILINE,
-)
-NAME_AFTER_RE = re.compile(
-    r"(https?://\S+)\s*[-:]\s*([^\n]+)",
+# নাম হিসেবে skip করার pattern
+SKIP_LINE_RE = re.compile(
+    r"^(TG\s*[-–]|👤|@|\d+[.)]\s*|link\s*dropped|লিংক|url\s*[:\-]?$)",
+    re.IGNORECASE,
 )
 
 def normalize_url(url: str) -> str:
-    return url.rstrip(".,!?;)")
+    """trailing punctuation সরাবে কিন্তু query params রাখবে"""
+    return re.sub(r"[.,!?;)\]]+$", "", url)
 
 def extract_links(text: str) -> list[dict]:
-    found: dict[str, str] = {}
+    """
+    যেকোনো ফরম্যাট থেকে লিংক + নাম বের করে।
+    নাম না পেলে খালি string রাখে।
+    """
+    found: dict[str, str] = {}  # url → name
+    lines = text.splitlines()
 
-    for m in NAME_BEFORE_RE.finditer(text):
-        name = m.group(1).strip()
-        url  = normalize_url(m.group(2).strip())
-        found[url] = name
+    for i, line in enumerate(lines):
+        line_stripped = line.strip()
+        urls_in_line = URL_RE.findall(line_stripped)
+        if not urls_in_line:
+            continue
 
-    for m in NAME_AFTER_RE.finditer(text):
-        url  = normalize_url(m.group(1).strip())
-        name = m.group(2).strip()
-        if url not in found:
+        for raw_url in urls_in_line:
+            url = normalize_url(raw_url)
+            if url in found:
+                continue  # ✅ একই রানে duplicate skip
+
+            # একই লাইনে URL-এর আগে কিছু আছে কিনা দেখো
+            before = line_stripped[:line_stripped.index(raw_url)].strip().rstrip(":-–—।").strip()
+
+            if before and not SKIP_LINE_RE.match(before):
+                found[url] = before
+                continue
+
+            # আগের সর্বোচ্চ ৪টি লাইন থেকে নাম খোঁজো
+            name = ""
+            for j in range(i - 1, max(i - 5, -1), -1):
+                prev = lines[j].strip()
+                if not prev:
+                    continue
+                if SKIP_LINE_RE.match(prev):
+                    continue
+                # অন্য URL থাকলে stop
+                if URL_RE.search(prev):
+                    break
+                candidate = prev.rstrip(":").strip()
+                if candidate:
+                    name = candidate
+                    break
+
             found[url] = name
 
+    # Fallback: কোনো URL মিস হলে ধরো
     for m in URL_RE.finditer(text):
         url = normalize_url(m.group(0))
         if url not in found:
@@ -154,6 +178,7 @@ def expire_old_entries(store: dict) -> dict:
     }
 
 def all_saved_urls(store: dict) -> set[str]:
+    """Gist-এ সেভ থাকা সব URL একটা set-এ রিটার্ন করে"""
     urls = set()
     for links in store.values():
         for item in links:
@@ -163,17 +188,18 @@ def all_saved_urls(store: dict) -> set[str]:
 async def process_links(new_items: list[dict]) -> tuple[list[dict], list[dict]]:
     store = await gist_read()
     store = expire_old_entries(store)
-    saved_urls = all_saved_urls(store)
+    saved_urls = all_saved_urls(store)  # ✅ Gist থেকে আগের সব URL
 
     unique_items    = []
     duplicate_items = []
 
     for item in new_items:
         if item["url"] in saved_urls:
+            # ✅ আগে থেকে Gist-এ আছে → duplicate
             duplicate_items.append(item)
         else:
             unique_items.append(item)
-            saved_urls.add(item["url"])
+            saved_urls.add(item["url"])  # ✅ এই রানে আর দ্বিতীয়বার সেভ হবে না
 
     today = today_str()
     if unique_items:
@@ -189,7 +215,7 @@ async def cmd_start(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         return
     await update.message.reply_text(
         "👋 আমি ডুপ্লিকেট লিংক ডিটেক্টর বট!\n\n"
-        "যেকোনো বার্তায় লিংক পাঠান। আমি ৩ দিনের মধ্যে দেওয়া লিংকগুলোর সাথে মিলিয়ে দেখব।\n\n"
+        "যেকোনো ফরম্যাটে লিংক পাঠান। আমি ৩ দিনের মধ্যে দেওয়া লিংকগুলোর সাথে মিলিয়ে দেখব।\n\n"
         "📌 কমান্ড:\n"
         "/start - এই বার্তা\n"
         "/stats - কতটি লিংক সেভ আছে\n"
@@ -217,7 +243,6 @@ async def handle_message(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     if not await owner_only(update):
         return
 
-    # ✅ টেক্সট এবং ক্যাপশন দুটোই সাপোর্ট করবে
     text = update.message.text or update.message.caption or ""
     if not text:
         return
@@ -231,20 +256,16 @@ async def handle_message(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     lines = []
 
     if dupes:
-        lines.append(f"🔁 *ডুপ্লিকেট লিংক পাওয়া গেছে ({len(dupes)} টি):*")
+        lines.append(f"🔁 *ডুপ্লিকেট লিংক ({len(dupes)} টি):*")
         for item in dupes:
-            if item["name"]:
-                lines.append(f"  • {item['name']}: {item['url']}")
-            else:
-                lines.append(f"  • {item['url']}")
+            label = item["name"] if item["name"] else item["url"]
+            lines.append(f"  • {label}")
 
     if unique:
-        lines.append(f"\n✅ *নতুন লিংক সেভ হয়েছে ({len(unique)} টি):*")
+        lines.append(f"\n✅ *নতুন লিংক সেভ ({len(unique)} টি):*")
         for item in unique:
-            if item["name"]:
-                lines.append(f"  • {item['name']}: {item['url']}")
-            else:
-                lines.append(f"  • {item['url']}")
+            label = item["name"] if item["name"] else item["url"]
+            lines.append(f"  • {label}")
 
     if lines:
         await update.message.reply_text(
@@ -256,16 +277,14 @@ async def handle_message(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 
 # ─── MAIN ────────────────────────────────────────────────────────────────────────
 def main():
-    validate_config()  # ✅ সব ভেরিয়েবল চেক
+    validate_config()
     app = ApplicationBuilder().token(TELEGRAM_TOKEN).build()
     app.add_handler(CommandHandler("start", cmd_start))
     app.add_handler(CommandHandler("stats", cmd_stats))
     app.add_handler(CommandHandler("clear", cmd_clear))
-    # ✅ টেক্সট + ক্যাপশন (ছবি/ফাইলের সাথে লিংক) দুটোই ধরবে
     app.add_handler(MessageHandler(filters.TEXT | filters.CAPTION, handle_message))
     log.info("Bot starting… Owner ID: %s", OWNER_ID)
     app.run_polling()
 
 if __name__ == "__main__":
     main()
-    
