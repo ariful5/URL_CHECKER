@@ -256,13 +256,14 @@ async def handle_message(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     lines = []
 
     if dupes:
-        lines.append(f"🔁 *ডুপ্লিকেট লিংক ({len(dupes)} টি):*")
+    if dupes:
+        lines.append(f"🔁 ডুপ্লিকেট লিংক ({len(dupes)} টি):")   # * নেই
         for item in dupes:
             label = item["name"] if item["name"] else item["url"]
             lines.append(f"  • {label}")
 
     if unique:
-        lines.append(f"\n✅ *নতুন লিংক সেভ ({len(unique)} টি):*")
+        lines.append(f"\n✅ নতুন লিংক সেভ ({len(unique)} টি):")   # * নেই
         for item in unique:
             label = item["name"] if item["name"] else item["url"]
             lines.append(f"  • {label}")
@@ -270,7 +271,7 @@ async def handle_message(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     if lines:
         await update.message.reply_text(
             "\n".join(lines),
-            parse_mode="Markdown",
+            parse_mode=None,                   # ✅ plain text, কোনো parse error নেই
             disable_web_page_preview=True,
         )
     else:
