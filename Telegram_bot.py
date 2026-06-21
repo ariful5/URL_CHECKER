@@ -6,12 +6,14 @@ Telegram Duplicate Link Detector Bot
 - Uses GitHub Gist for persistent storage
 - Extracts links and optional names from messages
 - Only the bot OWNER can use this bot
+- Auto-shuts down after MAX_RUNTIME_SECONDS (for CI job runtime limits)
 """
 
 import os
 import re
 import json
 import logging
+import threading
 from datetime import datetime, timedelta, timezone
 from telegram import Update
 from telegram.ext import ApplicationBuilder, CommandHandler, MessageHandler, filters, ContextTypes
@@ -24,6 +26,10 @@ GIST_ID        = os.environ.get("GIST_ID")
 OWNER_ID       = int(os.environ.get("OWNER_ID", "0"))
 GIST_FILENAME  = "link_store.json"
 KEEP_DAYS      = 3
+
+# বট সর্বোচ্চ এত সময় চলার পর নিজে থেকে বন্ধ হয়ে যাবে (GitHub Actions এর ৬ ঘন্টা
+# লিমিটের আগেই যাতে প্রসেসটা ক্লিনভাবে exit করে এবং job সাকসেস হিসেবে দেখায়)
+MAX_RUNTIME_SECONDS = 5 * 3600 + 59 * 60  # 5 ঘন্টা ৫৯ মিনিট = 21540 সেকেন্ড
 
 logging.basicConfig(
     format="%(asctime)s [%(levelname)s] %(message)s",
@@ -39,6 +45,16 @@ def validate_config():
     if OWNER_ID == 0:      missing.append("OWNER_ID")
     if missing:
         raise ValueError(f"❌ Missing environment variables: {', '.join(missing)}")
+
+# ─── SELF-SHUTDOWN TIMER ────────────────────────────────────────────────────────
+def schedule_self_shutdown(seconds: int):
+    def _shutdown():
+        log.info("⏰ সর্বোচ্চ রানটাইম (%s সেকেন্ড) শেষ — বট নিজে থেকে বন্ধ হচ্ছে...", seconds)
+        os._exit(0)
+    timer = threading.Timer(seconds, _shutdown)
+    timer.daemon = True
+    timer.start()
+    return timer
 
 # ─── OWNER-ONLY GUARD ──────────────────────────────────────────────────────────
 def is_owner(update: Update) -> bool:
@@ -287,7 +303,9 @@ def main():
     app.add_handler(CommandHandler("clear", cmd_clear))
     app.add_handler(MessageHandler(filters.TEXT | filters.CAPTION, handle_message))
     log.info("Bot starting… Owner ID: %s", OWNER_ID)
+    schedule_self_shutdown(MAX_RUNTIME_SECONDS)
     app.run_polling()
 
 if __name__ == "__main__":
     main()
+        
