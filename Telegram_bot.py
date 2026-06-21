@@ -21,7 +21,7 @@ import httpx
 
 # ─── CONFIG ──────────────────────────────────────────────────────────────
 TELEGRAM_TOKEN = os.environ.get("TELEGRAM_TOKEN")
-GITHUB_TOKEN   = os.environ.get("GTHUB_TOKEN")
+GITHUB_TOKEN   = os.environ.get("GITHUB_TOKEN")
 GIST_ID        = os.environ.get("GIST_ID")
 OWNER_ID       = int(os.environ.get("OWNER_ID", "0"))
 GIST_FILENAME  = "link_store.json"
@@ -332,6 +332,42 @@ def format_item(item: dict) -> str:
     return f"  • {url}"
 
 
+TELEGRAM_MAX_LEN = 4096
+
+
+async def send_long_message(update: Update, lines: list[str]):
+    """
+    Telegram caps a single message at 4096 characters. When the link list
+    is long, split it into multiple messages instead of sending one giant
+    blob that Telegram would otherwise silently reject.
+    """
+    chunks = []
+    current = ""
+    for line in lines:
+        candidate = (current + "\n" + line) if current else line
+        if len(candidate) > TELEGRAM_MAX_LEN:
+            if current:
+                chunks.append(current)
+            # Single line itself longer than the limit (very rare) - hard split it
+            if len(line) > TELEGRAM_MAX_LEN:
+                for k in range(0, len(line), TELEGRAM_MAX_LEN):
+                    chunks.append(line[k:k + TELEGRAM_MAX_LEN])
+                current = ""
+            else:
+                current = line
+        else:
+            current = candidate
+    if current:
+        chunks.append(current)
+
+    for chunk in chunks:
+        await update.message.reply_text(
+            chunk,
+            parse_mode=None,
+            disable_web_page_preview=True,
+        )
+
+
 async def handle_message(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     if not await owner_only(update):
         return
@@ -362,11 +398,7 @@ async def handle_message(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             lines.append(format_item(item))
 
     if lines:
-        await update.message.reply_text(
-            "\n".join(lines),
-            parse_mode=None,
-            disable_web_page_preview=True,
-        )
+        await send_long_message(update, lines)
     else:
         log.warning("No lines to send despite %d items", len(new_items))
         await update.message.reply_text("⚠️ কিছু প্রসেস হয়নি — log চেক করুন।")
@@ -387,4 +419,3 @@ def main():
 
 if __name__ == "__main__":
     main()
-            
