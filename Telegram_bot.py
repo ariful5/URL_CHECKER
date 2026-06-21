@@ -21,7 +21,7 @@ import httpx
 
 # ─── CONFIG ──────────────────────────────────────────────────────────────
 TELEGRAM_TOKEN = os.environ.get("TELEGRAM_TOKEN")
-GITHUB_TOKEN   = os.environ.get("GITHUB_TOKEN")
+GITHUB_TOKEN   = os.environ.get("GTHUB_TOKEN")
 GIST_ID        = os.environ.get("GIST_ID")
 OWNER_ID       = int(os.environ.get("OWNER_ID", "0"))
 GIST_FILENAME  = "link_store.json"
