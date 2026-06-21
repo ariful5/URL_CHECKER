@@ -4,7 +4,7 @@ Telegram Duplicate Link Detector Bot
 - Stores links for 3 days (auto-expires on 4th day)
 - Detects duplicate URLs (ignores names)
 - Uses GitHub Gist for persistent storage
-- Extracts links and optional names from messages
+- Extracts links and the associated name/username from messages
 - Only the bot OWNER can use this bot
 - Auto-shuts down after MAX_RUNTIME_SECONDS (for CI job runtime limits)
 """
@@ -19,23 +19,24 @@ from telegram import Update
 from telegram.ext import ApplicationBuilder, CommandHandler, MessageHandler, filters, ContextTypes
 import httpx
 
-# ─── CONFIG ────────────────────────────────────────────────────────────────────
+# ─── CONFIG ──────────────────────────────────────────────────────────────
 TELEGRAM_TOKEN = os.environ.get("TELEGRAM_TOKEN")
-GITHUB_TOKEN   = os.environ.get("GTHUB_TOKEN")
+GITHUB_TOKEN   = os.environ.get("GITHUB_TOKEN")
 GIST_ID        = os.environ.get("GIST_ID")
 OWNER_ID       = int(os.environ.get("OWNER_ID", "0"))
 GIST_FILENAME  = "link_store.json"
 KEEP_DAYS      = 3
 
-# বট সর্বোচ্চ এত সময় চলার পর নিজে থেকে বন্ধ হয়ে যাবে (GitHub Actions এর ৬ ঘন্টা
-# লিমিটের আগেই যাতে প্রসেসটা ক্লিনভাবে exit করে এবং job সাকসেস হিসেবে দেখায়)
-MAX_RUNTIME_SECONDS = 5 * 3600 + 59 * 60  # 5 ঘন্টা ৫৯ মিনিট = 21540 সেকেন্ড
+# Auto-shutdown before GitHub Actions' 6-hour job limit, so the job exits
+# cleanly and is reported as a success.
+MAX_RUNTIME_SECONDS = 5 * 3600 + 59 * 60  # 5h 59m = 21540 seconds
 
 logging.basicConfig(
     format="%(asctime)s [%(levelname)s] %(message)s",
     level=logging.INFO,
 )
 log = logging.getLogger(__name__)
+
 
 def validate_config():
     missing = []
@@ -46,19 +47,22 @@ def validate_config():
     if missing:
         raise ValueError(f"❌ Missing environment variables: {', '.join(missing)}")
 
-# ─── SELF-SHUTDOWN TIMER ────────────────────────────────────────────────────────
+
+# ─── SELF-SHUTDOWN TIMER ────────────────────────────────────────────────
 def schedule_self_shutdown(seconds: int):
     def _shutdown():
-        log.info("⏰ সর্বোচ্চ রানটাইম (%s সেকেন্ড) শেষ — বট নিজে থেকে বন্ধ হচ্ছে...", seconds)
+        log.info("⏰ Max runtime (%s sec) reached — shutting down.", seconds)
         os._exit(0)
     timer = threading.Timer(seconds, _shutdown)
     timer.daemon = True
     timer.start()
     return timer
 
-# ─── OWNER-ONLY GUARD ──────────────────────────────────────────────────────────
+
+# ─── OWNER-ONLY GUARD ───────────────────────────────────────────────────
 def is_owner(update: Update) -> bool:
     return update.effective_user.id == OWNER_ID
+
 
 async def owner_only(update: Update) -> bool:
     if not is_owner(update):
@@ -70,19 +74,82 @@ async def owner_only(update: Update) -> bool:
         return False
     return True
 
-# ─── URL EXTRACTION ─────────────────────────────────────────────────────────────
+
+# ─── URL EXTRACTION ──────────────────────────────────────────────────────
 URL_RE = re.compile(
-    r"https?://[^\s\)\]\>,\"\']+",
+    r"(?:https?://)?(?:www\.)?x\.com/[^\s\)\]\>,\"\']+"
+    r"|(?:https?://)?(?:www\.)?twitter\.com/[^\s\)\]\>,\"\']+"
+    r"|https?://[^\s\)\]\>,\"\']+",
     re.IGNORECASE,
 )
 
+# Lines that are clearly NOT a name/username line and should be skipped
+# when scanning upward for a name (post headers, "Link dropped:", bullets,
+# numbering, the bot banner, the literal TG- line is handled separately).
 SKIP_LINE_RE = re.compile(
-    r"^(TG\s*[-–]|👤|@|\d+[.)]\s*|link\s*dropped|লিংক|url\s*[:\-]?$)",
+    r"^(post\s*#?\d+|#\d+|👤|link\s*dropped\s*:?$|লিংক|url\s*[:\-]?$|"
+    r"[\U0001F300-\U0001FAFF\u2600-\u27BF\s]*$)",
     re.IGNORECASE,
 )
+
+TG_LINE_RE = re.compile(r"^TG\s*[-–]\s*(@\S+)", re.IGNORECASE)
+USERNAME_LABEL_RE = re.compile(r"^username\s*[:：]\s*(@?\S+)", re.IGNORECASE)
+NAME_LABEL_RE = re.compile(r"^name\s*[:：]\s*(.+)", re.IGNORECASE)
+
 
 def normalize_url(url: str) -> str:
-    return re.sub(r"[.,!?;)\]]+$", "", url)
+    url = re.sub(r"[.,!?;)\]]+$", "", url)
+    if not url.lower().startswith("http"):
+        url = "https://" + url
+    return url
+
+
+def clean_name_line(line: str) -> str:
+    """Strip a trailing colon and leading bullet/number markers from a candidate name line."""
+    line = line.strip()
+    line = re.sub(r"^[•\-\*\u2022]\s*", "", line)
+    line = re.sub(r"^\d+[.)]\s*", "", line)
+    line = line.rstrip(":：").strip()
+    return line
+
+
+def pick_name_for_line(prev_line: str) -> str | None:
+    """
+    Given a single non-empty line immediately preceding (or near) a URL line,
+    decide if it's usable as a name, and if so return the cleaned name.
+    Returns None if this line should be skipped (not a name candidate).
+    """
+    raw = prev_line.strip()
+    if not raw:
+        return None
+
+    # "TG - @username" -> use @username
+    tg_match = TG_LINE_RE.match(raw)
+    if tg_match:
+        return tg_match.group(1)
+
+    # "Username: @handle" -> use @handle (preferred over a "Name:" line above it)
+    username_match = USERNAME_LABEL_RE.match(raw)
+    if username_match:
+        return username_match.group(1)
+
+    # "Name: Some Person" -> use "Some Person"
+    name_match = NAME_LABEL_RE.match(raw)
+    if name_match:
+        return name_match.group(1).strip()
+
+    # Skip post headers, emoji-only lines, "Link dropped:", numbering like #171
+    if SKIP_LINE_RE.match(raw):
+        return None
+
+    # A line like "@Ishan67262969 MadarM49564" -> take the @username token
+    at_match = re.match(r"^(@\S+)", raw)
+    if at_match:
+        return at_match.group(1)
+
+    cleaned = clean_name_line(raw)
+    return cleaned if cleaned else None
+
 
 def extract_links(text: str) -> list[dict]:
     found: dict[str, str] = {}
@@ -99,43 +166,41 @@ def extract_links(text: str) -> list[dict]:
             if url in found:
                 continue
 
-            before = line_stripped[:line_stripped.index(raw_url)].strip().rstrip(":-–—।").strip()
-
-            if before and not SKIP_LINE_RE.match(before):
-                found[url] = before
-                continue
+            # Text before the URL on the same line (e.g. "Name: <url>")
+            idx = line_stripped.find(raw_url)
+            before = line_stripped[:idx].strip().rstrip(":：-–—।").strip()
+            before = re.sub(r"^[•\-\*\u2022]\s*", "", before)
 
             name = ""
-            for j in range(i - 1, max(i - 5, -1), -1):
-                prev = lines[j].strip()
-                if not prev:
-                    continue
-                if SKIP_LINE_RE.match(prev):
-                    continue
-                if URL_RE.search(prev):
-                    break
-                candidate = prev.rstrip(":").strip()
-                if candidate:
+            if before:
+                name = before
+            else:
+                # Scan upward for the nearest usable name line, skipping
+                # blank lines, headers, "Link dropped:", emoji banners, etc.
+                for j in range(i - 1, max(i - 6, -1), -1):
+                    prev = lines[j].strip()
+                    if not prev:
+                        continue
+                    if URL_RE.search(prev):
+                        break  # hit a previous URL block, stop searching
+                    candidate = pick_name_for_line(prev)
+                    if candidate is None:
+                        continue
                     name = candidate
                     break
 
             found[url] = name
 
-    # Fallback
-    for m in URL_RE.finditer(text):
-        url = normalize_url(m.group(0))
-        if url not in found:
-            found[url] = ""
-
     return [{"url": u, "name": n} for u, n in found.items()]
 
 
-# ─── GIST STORAGE ───────────────────────────────────────────────────────────────
+# ─── GIST STORAGE ─────────────────────────────────────────────────────────
 def gist_headers() -> dict:
     return {
         "Authorization": f"token {GITHUB_TOKEN}",
         "Accept": "application/vnd.github+json",
     }
+
 
 async def gist_read() -> dict:
     async with httpx.AsyncClient() as client:
@@ -152,6 +217,7 @@ async def gist_read() -> dict:
         return json.loads(raw)
     except json.JSONDecodeError:
         return {}
+
 
 async def gist_write(data: dict) -> bool:
     payload = {
@@ -172,9 +238,10 @@ async def gist_write(data: dict) -> bool:
     return True
 
 
-# ─── LINK STORE LOGIC ───────────────────────────────────────────────────────────
+# ─── LINK STORE LOGIC ─────────────────────────────────────────────────────
 def today_str() -> str:
     return datetime.now(timezone.utc).strftime("%Y-%m-%d")
+
 
 def expire_old_entries(store: dict) -> dict:
     cutoff = datetime.now(timezone.utc) - timedelta(days=KEEP_DAYS)
@@ -184,6 +251,7 @@ def expire_old_entries(store: dict) -> dict:
         if datetime.strptime(date_key, "%Y-%m-%d").replace(tzinfo=timezone.utc) >= cutoff
     }
 
+
 def all_saved_urls(store: dict) -> set[str]:
     urls = set()
     for links in store.values():
@@ -191,17 +259,18 @@ def all_saved_urls(store: dict) -> set[str]:
             urls.add(item["url"])
     return urls
 
+
 async def process_links(new_items: list[dict]) -> tuple[list[dict], list[dict]]:
     try:
         store = await gist_read()
-    except Exception as e:
+    except Exception:
         log.exception("gist_read failed")
         store = {}
 
     store = expire_old_entries(store)
     saved_urls = all_saved_urls(store)
 
-    unique_items    = []
+    unique_items = []
     duplicate_items = []
 
     for item in new_items:
@@ -216,13 +285,13 @@ async def process_links(new_items: list[dict]) -> tuple[list[dict], list[dict]]:
         store.setdefault(today, []).extend(unique_items)
         try:
             await gist_write(store)
-        except Exception as e:
+        except Exception:
             log.exception("gist_write failed")
 
     return unique_items, duplicate_items
 
 
-# ─── TELEGRAM HANDLERS ──────────────────────────────────────────────────────────
+# ─── TELEGRAM HANDLERS ────────────────────────────────────────────────────
 async def cmd_start(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     if not await owner_only(update):
         return
@@ -235,6 +304,7 @@ async def cmd_start(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         "/clear - সব লিংক মুছে ফেলুন"
     )
 
+
 async def cmd_stats(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     if not await owner_only(update):
         return
@@ -246,11 +316,21 @@ async def cmd_stats(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         lines.append(f"  {date_key}: {len(store[date_key])} টি")
     await update.message.reply_text("\n".join(lines))
 
+
 async def cmd_clear(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     if not await owner_only(update):
         return
     await gist_write({})
     await update.message.reply_text("✅ সব লিংক মুছে ফেলা হয়েছে।")
+
+
+def format_item(item: dict) -> str:
+    name = item["name"]
+    url = item["url"]
+    if name:
+        return f"  • {name} — {url}"
+    return f"  • {url}"
+
 
 async def handle_message(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     if not await owner_only(update):
@@ -272,21 +352,19 @@ async def handle_message(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     lines = []
 
     if dupes:
-        lines.append(f"🔁 ডুপ্লিকেট লিংক ({len(dupes)} টি):")   # * নেই
+        lines.append(f"🔁 ডুপ্লিকেট লিংক ({len(dupes)} টি):")
         for item in dupes:
-            label = item["name"] if item["name"] else item["url"]
-            lines.append(f"  • {label}")
+            lines.append(format_item(item))
 
     if unique:
-        lines.append(f"\n✅ নতুন লিংক সেভ ({len(unique)} টি):")   # * নেই
+        lines.append(f"\n✅ নতুন লিংক সেভ ({len(unique)} টি):")
         for item in unique:
-            label = item["name"] if item["name"] else item["url"]
-            lines.append(f"  • {label}")
+            lines.append(format_item(item))
 
     if lines:
         await update.message.reply_text(
             "\n".join(lines),
-            parse_mode=None,                   # ✅ plain text, কোনো parse error নেই
+            parse_mode=None,
             disable_web_page_preview=True,
         )
     else:
@@ -294,7 +372,7 @@ async def handle_message(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("⚠️ কিছু প্রসেস হয়নি — log চেক করুন।")
 
 
-# ─── MAIN ────────────────────────────────────────────────────────────────────────
+# ─── MAIN ──────────────────────────────────────────────────────────────
 def main():
     validate_config()
     app = ApplicationBuilder().token(TELEGRAM_TOKEN).build()
@@ -306,6 +384,7 @@ def main():
     schedule_self_shutdown(MAX_RUNTIME_SECONDS)
     app.run_polling()
 
+
 if __name__ == "__main__":
     main()
-        
+            
