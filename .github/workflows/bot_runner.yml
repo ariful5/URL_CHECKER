@@ -3,10 +3,14 @@ name: Telegram Bot Runner
 on:
   workflow_dispatch:
 
+concurrency:
+  group: telegram-bot-runner
+  cancel-in-progress: true   
+
 jobs:
   run-bot:
     runs-on: ubuntu-latest
-    timeout-minutes: 119  # ২ ঘন্টার একটু কম (GitHub সীমা ৬ ঘন্টা)
+    timeout-minutes: 360  
 
     steps:
       - name: Checkout code
@@ -22,7 +26,7 @@ jobs:
           pip install python-telegram-bot httpx
 
       - name: Run Telegram Bot
-        timeout-minutes: 118
+        timeout-minutes: 360
         env:
           TELEGRAM_TOKEN: ${{ secrets.TELEGRAM_TOKEN }}
           GTHUB_TOKEN: ${{ secrets.GTHUB_TOKEN }}
