@@ -1,12 +1,13 @@
 #!/usr/bin/env python3
 """
 Telegram Duplicate Link Detector Bot
-- Stores links for 3 days (auto-expires on 4th day)
+- Stores links for 3 days (day = 6 AM BD time to next 6 AM BD time)
 - Detects duplicate URLs (ignores names)
 - Uses GitHub Gist for persistent storage
 - Extracts links and the associated name/username from messages
 - Only the bot OWNER can use this bot
 - Auto-shuts down after MAX_RUNTIME_SECONDS (for CI job runtime limits)
+- /clear has a 10-minute undo button for safety
 """
 
 import os
@@ -15,8 +16,15 @@ import json
 import logging
 import threading
 from datetime import datetime, timedelta, timezone
-from telegram import Update
-from telegram.ext import ApplicationBuilder, CommandHandler, MessageHandler, filters, ContextTypes
+from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
+from telegram.ext import (
+    ApplicationBuilder,
+    CommandHandler,
+    MessageHandler,
+    CallbackQueryHandler,
+    filters,
+    ContextTypes,
+)
 import httpx
 
 # ─── CONFIG ──────────────────────────────────────────────────────────────
@@ -26,16 +34,21 @@ GIST_ID        = os.environ.get("GIST_ID")
 OWNER_ID       = int(os.environ.get("OWNER_ID", "0"))
 GIST_FILENAME  = "link_store.json"
 KEEP_DAYS      = 3
+BD_UTC_OFFSET  = 6          # Bangladesh = UTC+6
+DAY_START_HOUR = 6          # নতুন দিন শুরু হয় সকাল ৬টায় (BD time)
+UNDO_SECONDS   = 600        # Undo বাটন ১০ মিনিট কাজ করবে
 
-# Auto-shutdown before GitHub Actions' 6-hour job limit, so the job exits
-# cleanly and is reported as a success.
-MAX_RUNTIME_SECONDS = 5 * 3600 + 59 * 60  # 5h 59m = 21540 seconds
+# Auto-shutdown before GitHub Actions' 6-hour job limit
+MAX_RUNTIME_SECONDS = 5 * 3600 + 59 * 60  # 5h 59m
 
 logging.basicConfig(
     format="%(asctime)s [%(levelname)s] %(message)s",
     level=logging.INFO,
 )
 log = logging.getLogger(__name__)
+
+# ─── undo store: { message_id: {"backup": store_dict, "expires": datetime} }
+_undo_store: dict[int, dict] = {}
 
 
 def validate_config():
@@ -83,18 +96,15 @@ URL_RE = re.compile(
     re.IGNORECASE,
 )
 
-# Lines that are clearly NOT a name/username line and should be skipped
-# when scanning upward for a name (post headers, "Link dropped:", bullets,
-# numbering, the bot banner, the literal TG- line is handled separately).
 SKIP_LINE_RE = re.compile(
     r"^(post\s*#?\d+|#\d+|👤|link\s*dropped\s*:?$|লিংক|url\s*[:\-]?$|"
     r"[\U0001F300-\U0001FAFF\u2600-\u27BF\s]*$)",
     re.IGNORECASE,
 )
 
-TG_LINE_RE = re.compile(r"^TG\s*[-–]\s*(@\S+)", re.IGNORECASE)
+TG_LINE_RE        = re.compile(r"^TG\s*[-–]\s*(@\S+)", re.IGNORECASE)
 USERNAME_LABEL_RE = re.compile(r"^username\s*[:：]\s*(@?\S+)", re.IGNORECASE)
-NAME_LABEL_RE = re.compile(r"^name\s*[:：]\s*(.+)", re.IGNORECASE)
+NAME_LABEL_RE     = re.compile(r"^name\s*[:：]\s*(.+)", re.IGNORECASE)
 
 
 def normalize_url(url: str) -> str:
@@ -105,7 +115,6 @@ def normalize_url(url: str) -> str:
 
 
 def clean_name_line(line: str) -> str:
-    """Strip a trailing colon and leading bullet/number markers from a candidate name line."""
     line = line.strip()
     line = re.sub(r"^[•\-\*\u2022]\s*", "", line)
     line = re.sub(r"^\d+[.)]\s*", "", line)
@@ -114,35 +123,25 @@ def clean_name_line(line: str) -> str:
 
 
 def pick_name_for_line(prev_line: str) -> str | None:
-    """
-    Given a single non-empty line immediately preceding (or near) a URL line,
-    decide if it's usable as a name, and if so return the cleaned name.
-    Returns None if this line should be skipped (not a name candidate).
-    """
     raw = prev_line.strip()
     if not raw:
         return None
 
-    # "TG - @username" -> use @username
     tg_match = TG_LINE_RE.match(raw)
     if tg_match:
         return tg_match.group(1)
 
-    # "Username: @handle" -> use @handle (preferred over a "Name:" line above it)
     username_match = USERNAME_LABEL_RE.match(raw)
     if username_match:
         return username_match.group(1)
 
-    # "Name: Some Person" -> use "Some Person"
     name_match = NAME_LABEL_RE.match(raw)
     if name_match:
         return name_match.group(1).strip()
 
-    # Skip post headers, emoji-only lines, "Link dropped:", numbering like #171
     if SKIP_LINE_RE.match(raw):
         return None
 
-    # A line like "@Ishan67262969 MadarM49564" -> take the @username token
     at_match = re.match(r"^(@\S+)", raw)
     if at_match:
         return at_match.group(1)
@@ -166,8 +165,7 @@ def extract_links(text: str) -> list[dict]:
             if url in found:
                 continue
 
-            # Text before the URL on the same line (e.g. "Name: <url>")
-            idx = line_stripped.find(raw_url)
+            idx    = line_stripped.find(raw_url)
             before = line_stripped[:idx].strip().rstrip(":：-–—।").strip()
             before = re.sub(r"^[•\-\*\u2022]\s*", "", before)
 
@@ -175,14 +173,12 @@ def extract_links(text: str) -> list[dict]:
             if before:
                 name = before
             else:
-                # Scan upward for the nearest usable name line, skipping
-                # blank lines, headers, "Link dropped:", emoji banners, etc.
                 for j in range(i - 1, max(i - 6, -1), -1):
                     prev = lines[j].strip()
                     if not prev:
                         continue
                     if URL_RE.search(prev):
-                        break  # hit a previous URL block, stop searching
+                        break
                     candidate = pick_name_for_line(prev)
                     if candidate is None:
                         continue
@@ -192,6 +188,37 @@ def extract_links(text: str) -> list[dict]:
             found[url] = name
 
     return [{"url": u, "name": n} for u, n in found.items()]
+
+
+# ─── BD-TIME DAY HELPERS ─────────────────────────────────────────────────
+def bd_now() -> datetime:
+    """বর্তমান সময় BD timezone এ (UTC+6)।"""
+    return datetime.now(timezone.utc) + timedelta(hours=BD_UTC_OFFSET)
+
+
+def today_str() -> str:
+    """
+    'আজকের' date key ফেরত দেয়।
+    সকাল ৬টার আগে হলে আগের দিনকে আজ ধরা হয়।
+    """
+    now_bd = bd_now()
+    if now_bd.hour < DAY_START_HOUR:
+        now_bd -= timedelta(days=1)
+    return now_bd.strftime("%Y-%m-%d")
+
+
+def expire_old_entries(store: dict) -> dict:
+    """
+    শুধু শেষ KEEP_DAYS দিনের entries রাখে।
+    date শুধু date এর সাথে তুলনা হয় — time নয়।
+    """
+    today_date  = datetime.strptime(today_str(), "%Y-%m-%d").date()
+    cutoff_date = today_date - timedelta(days=KEEP_DAYS - 1)
+    return {
+        date_key: links
+        for date_key, links in store.items()
+        if datetime.strptime(date_key, "%Y-%m-%d").date() >= cutoff_date
+    }
 
 
 # ─── GIST STORAGE ─────────────────────────────────────────────────────────
@@ -239,19 +266,6 @@ async def gist_write(data: dict) -> bool:
 
 
 # ─── LINK STORE LOGIC ─────────────────────────────────────────────────────
-def today_str() -> str:
-    return datetime.now(timezone.utc).strftime("%Y-%m-%d")
-
-
-def expire_old_entries(store: dict) -> dict:
-    cutoff = datetime.now(timezone.utc) - timedelta(days=KEEP_DAYS)
-    return {
-        date_key: links
-        for date_key, links in store.items()
-        if datetime.strptime(date_key, "%Y-%m-%d").replace(tzinfo=timezone.utc) >= cutoff
-    }
-
-
 def all_saved_urls(store: dict) -> set[str]:
     urls = set()
     for links in store.values():
@@ -267,10 +281,10 @@ async def process_links(new_items: list[dict]) -> tuple[list[dict], list[dict]]:
         log.exception("gist_read failed")
         store = {}
 
-    store = expire_old_entries(store)
+    store      = expire_old_entries(store)
     saved_urls = all_saved_urls(store)
 
-    unique_items = []
+    unique_items    = []
     duplicate_items = []
 
     for item in new_items:
@@ -301,7 +315,7 @@ async def cmd_start(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         "📌 কমান্ড:\n"
         "/start - এই বার্তা\n"
         "/stats - কতটি লিংক সেভ আছে\n"
-        "/clear - সব লিংক মুছে ফেলুন"
+        "/clear - সব লিংক মুছে ফেলুন (১০ মিনিট undo সুযোগ)"
     )
 
 
@@ -320,13 +334,84 @@ async def cmd_stats(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 async def cmd_clear(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     if not await owner_only(update):
         return
+
+    # ক্লিয়ার করার আগে backup নিয়ে রাখি
+    backup = await gist_read()
     await gist_write({})
-    await update.message.reply_text("✅ সব লিংক মুছে ফেলা হয়েছে।")
+
+    expires_at = datetime.now(timezone.utc) + timedelta(seconds=UNDO_SECONDS)
+
+    keyboard = InlineKeyboardMarkup([
+        [InlineKeyboardButton("↩️ Undo / ফিরিয়ে আনুন", callback_data="undo_clear")]
+    ])
+
+    sent = await update.message.reply_text(
+        "✅ সব লিংক মুছে ফেলা হয়েছে।\n"
+        f"⏳ ১০ মিনিটের মধ্যে Undo করতে পারবেন।",
+        reply_markup=keyboard,
+    )
+
+    # backup রাখি message id দিয়ে
+    _undo_store[sent.message_id] = {
+        "backup":  backup,
+        "expires": expires_at,
+    }
+
+    # ১০ মিনিট পর বাটন সরিয়ে দেব
+    async def remove_button():
+        import asyncio
+        await asyncio.sleep(UNDO_SECONDS)
+        try:
+            await sent.edit_reply_markup(reply_markup=None)
+            await sent.edit_text(
+                "✅ সব লিংক মুছে ফেলা হয়েছে।\n"
+                "⌛ Undo এর সময় শেষ হয়ে গেছে।"
+            )
+        except Exception:
+            pass
+        _undo_store.pop(sent.message_id, None)
+
+    import asyncio
+    asyncio.create_task(remove_button())
+
+
+async def callback_undo_clear(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+
+    if query.from_user.id != OWNER_ID:
+        await query.answer("❌ শুধু মালিক এটা করতে পারবেন।", show_alert=True)
+        return
+
+    msg_id = query.message.message_id
+    entry  = _undo_store.get(msg_id)
+
+    if not entry:
+        await query.edit_message_text("⌛ Undo এর সময় শেষ হয়ে গেছে।")
+        return
+
+    if datetime.now(timezone.utc) > entry["expires"]:
+        await query.edit_message_text("⌛ Undo এর সময় শেষ হয়ে গেছে।")
+        _undo_store.pop(msg_id, None)
+        return
+
+    # backup ফিরিয়ে দিই
+    ok = await gist_write(entry["backup"])
+    _undo_store.pop(msg_id, None)
+
+    if ok:
+        total = sum(len(v) for v in entry["backup"].values())
+        await query.edit_message_text(
+            f"✅ সফলভাবে ফিরিয়ে আনা হয়েছে!\n"
+            f"📊 মোট {total} টি লিংক পুনরুদ্ধার হয়েছে।"
+        )
+    else:
+        await query.edit_message_text("❌ Undo ব্যর্থ হয়েছে — Gist write error।")
 
 
 def format_item(item: dict) -> str:
     name = item["name"]
-    url = item["url"]
+    url  = item["url"]
     if name:
         return f"  • {name} — {url}"
     return f"  • {url}"
@@ -336,19 +421,13 @@ TELEGRAM_MAX_LEN = 4096
 
 
 async def send_long_message(update: Update, lines: list[str]):
-    """
-    Telegram caps a single message at 4096 characters. When the link list
-    is long, split it into multiple messages instead of sending one giant
-    blob that Telegram would otherwise silently reject.
-    """
-    chunks = []
+    chunks  = []
     current = ""
     for line in lines:
         candidate = (current + "\n" + line) if current else line
         if len(candidate) > TELEGRAM_MAX_LEN:
             if current:
                 chunks.append(current)
-            # Single line itself longer than the limit (very rare) - hard split it
             if len(line) > TELEGRAM_MAX_LEN:
                 for k in range(0, len(line), TELEGRAM_MAX_LEN):
                     chunks.append(line[k:k + TELEGRAM_MAX_LEN])
@@ -408,9 +487,10 @@ async def handle_message(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 def main():
     validate_config()
     app = ApplicationBuilder().token(TELEGRAM_TOKEN).build()
-    app.add_handler(CommandHandler("start", cmd_start))
-    app.add_handler(CommandHandler("stats", cmd_stats))
-    app.add_handler(CommandHandler("clear", cmd_clear))
+    app.add_handler(CommandHandler("start",  cmd_start))
+    app.add_handler(CommandHandler("stats",  cmd_stats))
+    app.add_handler(CommandHandler("clear",  cmd_clear))
+    app.add_handler(CallbackQueryHandler(callback_undo_clear, pattern="^undo_clear$"))
     app.add_handler(MessageHandler(filters.TEXT | filters.CAPTION, handle_message))
     log.info("Bot starting… Owner ID: %s", OWNER_ID)
     schedule_self_shutdown(MAX_RUNTIME_SECONDS)
@@ -419,3 +499,4 @@ def main():
 
 if __name__ == "__main__":
     main()
+        
